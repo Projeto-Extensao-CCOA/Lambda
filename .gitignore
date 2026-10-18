@@ -1,0 +1,26 @@
+# Source datasets are uploaded to S3, not stored in Git.
+*.csv
+*.tsv
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+.aws/
+credentials
+credentials.*
+*.pem
+*.key
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Terraform state and local configuration
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json

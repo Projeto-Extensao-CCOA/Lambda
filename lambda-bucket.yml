@@ -1,0 +1,161 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda autenticada que gera URL pre-assinada para upload direto na camada Bronze.
+
+Parameters:
+  BronzePrefix:
+    Type: String
+    Default: raw/
+    Description: Prefixo no bucket Bronze onde os arquivos serao gravados.
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._/-]*/$'
+    ConstraintDescription: O prefixo deve comecar com letra ou numero e terminar com /.
+
+Resources:
+  # Funcao Lambda que emite URL pre-assinada para o bucket Bronze existente.
+  GenerateUploadUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BronzeGetUploadUrlFunction
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role:
+        Fn::Sub: "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME:
+            Fn::Sub: "data-bronze-${AWS::AccountId}-${AWS::Region}-an"
+          BRONZE_PREFIX:
+            Ref: BronzePrefix
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import os
+          import re
+          from botocore.config import Config
+
+          s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          BRONZE_PREFIX = os.environ['BRONZE_PREFIX']
+          URL_EXPIRY_SECONDS = 21600
+
+          def lambda_handler(event, context):
+            try:
+              method = event.get('requestContext', {}).get('http', {}).get('method')
+              if method and method != 'POST':
+                return {
+                  'statusCode': 405,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'error': 'Use o metodo POST.'})
+              }
+
+              body = event.get('body') or '{}'
+              if event.get('isBase64Encoded', False):
+                body = base64.b64decode(body).decode('utf-8')
+              request = json.loads(body)
+              if not isinstance(request, dict):
+                return {
+                  'statusCode': 400,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'error': 'Corpo JSON invalido.'})
+                }
+
+              file_name = request.get('filename', '')
+              checksum = request.get('checksum_sha256', '')
+              if not isinstance(file_name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,254}', file_name):
+                return {
+                  'statusCode': 400,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'error': 'Nome de arquivo invalido.'})
+                }
+
+              try:
+                checksum_bytes = base64.b64decode(checksum, validate=True)
+              except (ValueError, TypeError):
+                checksum_bytes = b''
+              if len(checksum_bytes) != 32:
+                return {
+                  'statusCode': 400,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'error': 'checksum_sha256 deve ser SHA-256 em Base64.'})
+                }
+
+              object_key = f'{BRONZE_PREFIX}{file_name}'
+              upload_url = s3.generate_presigned_url(
+                'put_object',
+                Params={
+                  'Bucket': BUCKET_NAME,
+                  'Key': object_key,
+                  'ChecksumSHA256': checksum
+                },
+                ExpiresIn=URL_EXPIRY_SECONDS,
+                HttpMethod='PUT'
+              )
+
+              return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                  'upload_url': upload_url,
+                  'object_key': object_key,
+                  'expires_in': URL_EXPIRY_SECONDS
+                })
+              }
+            except Exception:
+              print('Falha ao gerar URL pre-assinada para upload Bronze.')
+              return {
+                'statusCode': 500,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Nao foi possivel gerar a URL de upload.'})
+              }
+
+  # 3. Endpoint HTTPS nativo da Lambda (Function URL)
+  LambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn:
+        Fn::GetAtt:
+          - GenerateUploadUrlFunction
+          - Arn
+      AuthType: AWS_IAM
+
+  LambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: GenerateUploadUrlFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal:
+        Fn::Sub: "arn:aws:iam::${AWS::AccountId}:root"
+      FunctionUrlAuthType: AWS_IAM
+
+  LambdaFunctionUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: GenerateUploadUrlFunction
+      Action: lambda:InvokeFunction
+      Principal:
+        Fn::Sub: "arn:aws:iam::${AWS::AccountId}:root"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  BronzeBucketName:
+    Description: Bucket Bronze existente usado pela Lambda
+    Value:
+      Fn::Sub: "data-bronze-${AWS::AccountId}-${AWS::Region}-an"
+
+  BronzePrefix:
+    Description: Prefixo usado para os objetos enviados
+    Value:
+      Ref: BronzePrefix
+
+  UploadApiEndpoint:
+    Description: Function URL autenticada para solicitar URL de upload
+    Value:
+      Fn::GetAtt:
+        - LambdaUrl
+        - FunctionUrl
+...
